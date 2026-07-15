@@ -1,0 +1,78 @@
+name: 實價登錄監測快報
+
+on:
+  schedule:
+    # GitHub cron 為 UTC；台灣時間 = UTC+8
+    - cron: '0 6 1,11,21 * *'    # 更新日 台灣時間 14:00 主跑（無新增也寄「系統正常」）
+    - cron: '0 10 1,11,21 * *'   # 更新日 台灣時間 18:00 補跑（政府延後發布保險）
+    - cron: '0 6 2,12,22 * *'    # 次日 台灣時間 14:00 補跑（有新增才寄信）
+  workflow_dispatch: {}           # 允許手動觸發測試
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lvr-monitor
+  cancel-in-progress: false
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: 判斷本次是否需要寄「無新增」通知
+        id: send_empty
+        run: |
+          # 只有「更新日 14:00 主跑」這個時段在無新增時才寄通知信；
+          # 其餘時段（18:00 補跑、次日補跑）若無新增則靜默略過，避免灌爆信箱。
+          HOUR_UTC=$(date -u +%H)
+          DAY=$(date -u +%d)
+          if [ "$HOUR_UTC" = "06" ] && { [ "$DAY" = "01" ] || [ "$DAY" = "11" ] || [ "$DAY" = "21" ]; }; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 執行主程式
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SEND_EMPTY: ${{ steps.send_empty.outputs.value }}
+        run: python main.py
+
+      - name: 保存 PDF／HTML 副本（Actions 頁面可下載，保留 30 天）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lvr-report
+          path: |
+            output/*.pdf
+            output/*.html
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Commit 更新後的狀態（seen_ids / history / meta）
+        if: always()
+        run: |
+          git config user.name "lvr-bot"
+          git config user.email "lvr-bot@users.noreply.github.com"
+          git add state/
+          if ! git diff --cached --quiet; then
+            git commit -m "更新比對狀態 $(date +'%Y-%m-%d %H:%M')"
+            git push
+          else
+            echo "狀態無變更，略過 commit"
+          fi
